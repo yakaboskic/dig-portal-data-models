@@ -97,6 +97,7 @@ def generate_registry(records: list[dict], output_path: Path):
     fieldnames = [
         "portal_id", "gwas_source_category", "legacy_phenotype_id",
         "phenotype_name", "legacy_trait_group", "trait_group", "trait_type",
+        "pigean_id",
     ]
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
@@ -110,6 +111,7 @@ def generate_registry(records: list[dict], output_path: Path):
                 "legacy_trait_group": r.get("legacy_trait_group", ""),
                 "trait_group": r.get("trait_group", "other"),
                 "trait_type": r["trait_type"],
+                "pigean_id": r.get("pigean_id", ""),
             })
     print(f"  Wrote registry: {output_path} ({len(records)} entries)")
 
@@ -174,6 +176,8 @@ def generate_linkml_instances(records: list[dict], output_path: Path):
             "trait_group": r.get("trait_group", "other"),
             "trait_type": r["trait_type"],
         }
+        if r.get("pigean_id"):
+            pheno["pigean_id"] = r["pigean_id"]
         if r.get("amp_description"):
             pheno["description"] = r["amp_description"]
         if r.get("amp_dichotomous"):
@@ -219,7 +223,7 @@ def generate_flattened_tsv(records: list[dict], output_path: Path):
     fieldnames = [
         "portal_id", "gwas_source_category", "legacy_trait_group", "trait_group",
         "phenotype", "phenotype_name", "description", "trait_type",
-        "is_dichotomous", "is_complex", "mapping_count",
+        "is_dichotomous", "is_complex", "pigean_id", "mapping_count",
         "target_id", "target_label", "target_ontology",
         "mapping_predicate", "confidence", "mapping_justification", "source",
     ]
@@ -242,6 +246,7 @@ def generate_flattened_tsv(records: list[dict], output_path: Path):
                 "trait_type": r["trait_type"],
                 "is_dichotomous": r.get("amp_dichotomous", ""),
                 "is_complex": "true" if r.get("amp_complex") == "complex" else ("false" if r.get("amp_complex") == "simple" else ""),
+                "pigean_id": r.get("pigean_id", ""),
                 "mapping_count": len(mappings),
             }
 

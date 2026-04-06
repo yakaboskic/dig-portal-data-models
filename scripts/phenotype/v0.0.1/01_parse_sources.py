@@ -17,6 +17,7 @@ import csv
 import json
 import re
 import sys
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
@@ -433,6 +434,235 @@ def extract_orphanet_id(phenotype: str) -> str | None:
 
 
 # ──────────────────────────────────────────────────────────
+# 7. Parse ORDO labels for PIGEAN missing phenotypes
+# ──────────────────────────────────────────────────────────
+_OWL_CLASS = "{http://www.w3.org/2002/07/owl#}Class"
+_RDF_ABOUT = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about"
+_RDFS_LABEL = "{http://www.w3.org/2000/01/rdf-schema#}label"
+_ORPHANET_IRI_PREFIX = "http://www.orpha.net/ORDO/Orphanet_"
+
+
+def build_ordo_label_map(ordo_path: Path) -> dict[str, str]:
+    """Extract Orphanet ID → disease name from ORDO OWL via streaming XML parse.
+
+    Uses iterparse for memory efficiency (~43MB file parses in seconds).
+    """
+    labels: dict[str, str] = {}
+    if not ordo_path.exists():
+        print(f"  WARNING: {ordo_path} not found, ORDO labels unavailable")
+        return labels
+
+    print(f"  Parsing ORDO labels from {ordo_path.name}...")
+    for event, elem in ET.iterparse(str(ordo_path), events=("end",)):
+        if elem.tag == _OWL_CLASS:
+            about = elem.get(_RDF_ABOUT, "")
+            if about.startswith(_ORPHANET_IRI_PREFIX):
+                orphanet_num = about[len(_ORPHANET_IRI_PREFIX) :]
+                label_elem = elem.find(_RDFS_LABEL)
+                if label_elem is not None and label_elem.text:
+                    labels[orphanet_num] = label_elem.text.strip()
+            elem.clear()
+    print(f"  Extracted {len(labels)} Orphanet labels from ORDO")
+    return labels
+
+
+# ──────────────────────────────────────────────────────────
+# 8. Helpers for PIGEAN missing phenotypes
+# ──────────────────────────────────────────────────────────
+_CAMEL_SPLIT = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def camel_case_to_name(s: str) -> str:
+    """Split camelCase or PascalCase string into space-separated words.
+
+    Examples: 'SerumUrea' → 'Serum Urea', 'Testosterone' → 'Testosterone'
+    """
+    return _CAMEL_SPLIT.sub(" ", s)
+
+
+def name_to_phenotype_id(name: str, orphanet_num: str) -> str:
+    """Convert a disease name to a legacy phenotype ID.
+
+    Matches existing rare_v2 convention: spaces→underscores, remove hyphens/slashes/commas/parens.
+    e.g., 'Hermansky-Pudlak syndrome' + '79430' → 'HermanskyPudlak_syndrome_Orphanet_79430'
+    """
+    clean = name.replace("-", "").replace("/", "").replace(",", "")
+    clean = clean.replace("(", "").replace(")", "").replace("'", "")
+    clean = clean.replace(" ", "_")
+    # Collapse multiple underscores
+    clean = re.sub(r"_+", "_", clean).strip("_")
+    return f"{clean}_Orphanet_{orphanet_num}"
+
+
+def parse_pigean_missing(
+    path: Path,
+    ordo_labels: dict[str, str],
+    gwas_catalog: dict[str, list[dict]],
+    amp_mappings: dict[str, dict],
+    mesh_mappings: dict[str, list[str]],
+) -> list[dict]:
+    """Parse PIGEAN missing phenotypes file and create consolidated records.
+
+    Handles three categories:
+      - rare_v2_Orphanet_NNNNN → rare disease with ORDO name lookup
+      - gcat_trait_* → GWAS Catalog trait
+      - everything else → portal phenotype
+    """
+    if not path.exists():
+        print(f"  WARNING: {path} not found, skipping PIGEAN phenotypes")
+        return []
+
+    with open(path) as f:
+        raw_ids = [line.strip() for line in f if line.strip()]
+
+    print(f"  PIGEAN missing phenotypes file: {len(raw_ids)} entries")
+
+    records: list[dict] = []
+    stats = {"rare_v2": 0, "gcat_trait": 0, "portal": 0, "names_resolved": 0}
+
+    for raw_id in raw_ids:
+        if raw_id.startswith("rare_v2_Orphanet_"):
+            orphanet_num = raw_id[len("rare_v2_Orphanet_") :]
+            disease_name = ordo_labels.get(orphanet_num, "")
+
+            if disease_name:
+                stats["names_resolved"] += 1
+                phenotype_id = name_to_phenotype_id(disease_name, orphanet_num)
+                phenotype_name = disease_name
+            else:
+                # Fallback: use raw ID format
+                phenotype_id = raw_id
+                phenotype_name = f"Orphanet {orphanet_num}"
+
+            records.append(
+                {
+                    "gwas_source_category": "rare_v2",
+                    "phenotype": phenotype_id,
+                    "phenotype_name": phenotype_name,
+                    "legacy_trait_group": "OTHER",
+                    "trait_group": "other",
+                    "trait_type": "rare_disease",
+                    "pigean_id": raw_id,
+                    "mappings": [
+                        {
+                            "target_id": f"ORPHANET:{orphanet_num}",
+                            "target_ontology": "ORPHANET",
+                            "target_label": disease_name,
+                            "mapping_predicate": "skos:exactMatch",
+                            "confidence": 0.95,
+                            "mapping_justification": "lexical_match",
+                            "source": "PIGEAN phenotype (embedded Orphanet ID)",
+                        }
+                    ],
+                }
+            )
+            stats["rare_v2"] += 1
+
+        elif raw_id.startswith("gcat_trait_"):
+            name = raw_id[len("gcat_trait_") :].replace("_", " ")
+            trait_type = classify_trait_type(raw_id, "gcat_trait", name)
+
+            # Try to get GWAS Catalog mappings
+            mappings: list[dict] = []
+            gwas_entries = gwas_catalog.get(name.lower(), [])
+            for entry in gwas_entries:
+                uris = entry["mapped_trait_uri"]
+                labels = entry["mapped_trait"]
+                uri_list = [u.strip() for u in uris.split(",") if u.strip()]
+                label_list = [l.strip() for l in labels.split(",")]
+                for i, uri in enumerate(uri_list):
+                    curie = uri_to_curie(uri)
+                    ontology = ontology_from_curie(curie)
+                    label = label_list[i] if i < len(label_list) else ""
+                    existing_ids = {m["target_id"] for m in mappings}
+                    if curie not in existing_ids:
+                        mappings.append(
+                            {
+                                "target_id": curie,
+                                "target_label": label,
+                                "target_ontology": ontology,
+                                "mapping_predicate": "skos:exactMatch",
+                                "confidence": 0.9,
+                                "mapping_justification": "gwas_catalog",
+                                "source": "gcat_v1.0.3.1.tsv",
+                            }
+                        )
+
+            records.append(
+                {
+                    "gwas_source_category": "gcat_trait",
+                    "phenotype": raw_id,
+                    "phenotype_name": name,
+                    "legacy_trait_group": "OTHER",
+                    "trait_group": "other",
+                    "trait_type": trait_type,
+                    "pigean_id": raw_id,
+                    "mappings": mappings,
+                }
+            )
+            stats["gcat_trait"] += 1
+
+        else:
+            # Portal phenotype (e.g., SerumUrea, Testosterone)
+            name = camel_case_to_name(raw_id)
+            amp_info = amp_mappings.get(raw_id)
+            trait_type = classify_trait_type(raw_id, "portal", name, amp_info)
+
+            mappings = []
+            if amp_info and amp_info["efo_id"] and amp_info["skos_predicate"]:
+                efo_id = amp_info["efo_id"]
+                ontology = ontology_from_curie(efo_id)
+                mappings.append(
+                    {
+                        "target_id": efo_id,
+                        "target_ontology": ontology,
+                        "mapping_predicate": amp_info["skos_predicate"],
+                        "confidence": 0.85,
+                        "mapping_justification": "inherited",
+                        "source": "amp-traits-mapping-portal-phenotypes_06262024.csv",
+                    }
+                )
+
+            # Check MeSH mappings too
+            mesh_ids = mesh_mappings.get(raw_id, [])
+            for mid in mesh_ids:
+                mappings.append(
+                    {
+                        "target_id": f"MESH:{mid}",
+                        "target_ontology": "MESH",
+                        "mapping_predicate": "skos:exactMatch",
+                        "confidence": 0.85,
+                        "mapping_justification": "inherited",
+                        "source": "portal_to_mesh_curated_collected.tsv",
+                    }
+                )
+
+            records.append(
+                {
+                    "gwas_source_category": "portal",
+                    "phenotype": raw_id,
+                    "phenotype_name": name,
+                    "legacy_trait_group": "OTHER",
+                    "trait_group": "other",
+                    "trait_type": trait_type,
+                    "pigean_id": raw_id,
+                    "mappings": mappings,
+                }
+            )
+            if amp_info:
+                records[-1]["amp_description"] = amp_info.get("description", "")
+                records[-1]["amp_complex"] = amp_info.get("complex_traits", "")
+                records[-1]["amp_dichotomous"] = amp_info.get("dichotomous", "")
+            stats["portal"] += 1
+
+    print(f"    rare_v2:    {stats['rare_v2']} ({stats['names_resolved']} names resolved from ORDO)")
+    print(f"    gcat_trait: {stats['gcat_trait']}")
+    print(f"    portal:     {stats['portal']}")
+
+    return records
+
+
+# ──────────────────────────────────────────────────────────
 # Main consolidation
 # ──────────────────────────────────────────────────────────
 def main():
@@ -446,6 +676,14 @@ def main():
         RAW / "amp-traits-mapping-portal-phenotypes_06262024.csv"
     )
     gwas_catalog = parse_gwas_catalog(RAW / "gcat_v1.0.3.1.tsv")
+
+    # 1b. Parse PIGEAN missing phenotypes
+    print("\nParsing PIGEAN missing phenotypes...")
+    ordo_labels = build_ordo_label_map(RAW / "ORDO_en_4.5.owl")
+    pigean_path = RAW / "phenoypes_not_in_phenotype_list_but_where_in_pigean_runs.txt"
+    pigean_records = parse_pigean_missing(
+        pigean_path, ordo_labels, gwas_catalog, amp_mappings, mesh_mappings,
+    )
 
     # 2. Build consolidated records
     print("\nConsolidating records...")
@@ -591,6 +829,27 @@ def main():
             record["amp_dichotomous"] = amp_info.get("dichotomous", "")
 
         consolidated.append(record)
+
+    # 2b. Append PIGEAN records and update stats
+    consolidated.extend(pigean_records)
+    for record in pigean_records:
+        stats["total"] += 1
+        stats["by_group"][record["gwas_source_category"]] += 1
+        stats["by_type"][record["trait_type"]] += 1
+        has_mesh = any(m["target_ontology"] == "MESH" for m in record.get("mappings", []))
+        has_efo = any(m["target_ontology"] == "EFO" for m in record.get("mappings", []))
+        has_orphanet = any(m["target_ontology"] == "ORPHANET" for m in record.get("mappings", []))
+        has_gwas = any(m["mapping_justification"] == "gwas_catalog" for m in record.get("mappings", []))
+        if has_mesh:
+            stats["with_mesh"] += 1
+        if has_efo:
+            stats["with_efo"] += 1
+        if has_orphanet:
+            stats["with_orphanet"] += 1
+        if has_gwas:
+            stats["with_gwas_efo"] += 1
+        if record.get("mappings"):
+            stats["with_any_mapping"] += 1
 
     # 3. Write output
     output_path = OUT / "01_consolidated_phenotypes.json"
